@@ -110,6 +110,7 @@ static uint32_t main_startup_timeout_ms(void) {
 #include "foundation/mem_events.h"
 #include "foundation/profile.h"
 #include "foundation/sha256.h"
+#include "foundation/build_stamp.h"
 #include "foundation/secure_random.h"
 #include "foundation/win_utf8.h" /* cbm_wide_to_utf8 — Windows UTF-8 argv (#423/#20); no-op on POSIX */
 #ifdef _WIN32
@@ -1310,6 +1311,9 @@ static int handle_subcommand(int argc, char **argv, cbm_project_lock_manager_t *
         }
         if (strcmp(argv[i], "install") == 0) {
             return cbm_cmd_install(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
+        }
+        if (strcmp(argv[i], "build-stamp") == 0) {
+            return cbm_build_stamp_cmd(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
         }
         if (strcmp(argv[i], "uninstall") == 0) {
             return cbm_cmd_uninstall(argc - i - SKIP_ONE, argv + i + SKIP_ONE);

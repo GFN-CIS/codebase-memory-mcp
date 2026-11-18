@@ -182,6 +182,9 @@ cbm_daemon_process_role_t cbm_daemon_process_role(int argc, char *const argv[]) 
          * (CI: publish the team artifact, select tests); it never reads or
          * writes the daemon's projects, so it needs no daemon. */
         "test-impact",
+        /* build-stamp writes the build identity into a freshly linked
+         * executable during the build; it touches no daemon state. */
+        "build-stamp",
     };
     /* Stop at the first top-level mode token. Tool names, flag values, and JSON
      * following `cli` are opaque user input: a search query named "install"

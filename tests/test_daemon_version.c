@@ -12,6 +12,7 @@
 #include "daemon/runtime.h"
 #include "daemon/service.h"
 #include "daemon/service_internal.h"
+#include "foundation/build_stamp.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
@@ -243,6 +244,155 @@ TEST(daemon_build_fingerprint_hashes_exact_executable_bytes) {
     version_test_cleanup(dir, first_path, second_path, NULL);
     PASS();
 }
+
+/* ── #2683: build stamp ───────────────────────────────────────────── */
+
+enum { STAMP_TEST_PREFIX = 1000, STAMP_TEST_SUFFIX = 777 };
+
+/* prefix | magic | payload | suffix, with a deterministic byte pattern. */
+static size_t stamp_test_image(uint8_t *out, size_t cap, uint8_t payload_fill, bool with_magic) {
+    size_t need = STAMP_TEST_PREFIX + CBM_BUILD_STAMP_MAGIC_LEN + CBM_BUILD_STAMP_PAYLOAD_LEN +
+                  STAMP_TEST_SUFFIX;
+    if (cap < need) {
+        return 0;
+    }
+    for (size_t i = 0; i < need; i++) {
+        out[i] = (uint8_t)((i * 131U + 7U) & 0x7FU); /* never 0x89, the magic's first byte */
+    }
+    if (with_magic) {
+        cbm_build_stamp_magic(out + STAMP_TEST_PREFIX);
+        memset(out + STAMP_TEST_PREFIX + CBM_BUILD_STAMP_MAGIC_LEN, payload_fill,
+               CBM_BUILD_STAMP_PAYLOAD_LEN);
+    }
+    return need;
+}
+
+static void stamp_test_digest_hex(const uint8_t digest[CBM_SHA256_DIGEST_LEN],
+                                  char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2U] = hex[digest[i] >> 4U];
+        out[i * 2U + 1U] = hex[digest[i] & 0x0FU];
+    }
+    out[CBM_SHA256_DIGEST_LEN * 2U] = '\0';
+}
+
+/* Feed a copy of image in chunks of chunk bytes; return the hex digest. */
+static size_t stamp_test_hash_chunked(const uint8_t *image, size_t len, size_t chunk,
+                                      char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
+    uint8_t copy[4096];
+    memcpy(copy, image, len);
+    cbm_build_stamp_hasher_t hasher;
+    cbm_build_stamp_hasher_init(&hasher);
+    for (size_t at = 0; at < len; at += chunk) {
+        size_t take = len - at < chunk ? len - at : chunk;
+        cbm_build_stamp_hasher_update(&hasher, copy + at, take);
+    }
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_build_stamp_hasher_final(&hasher, digest);
+    stamp_test_digest_hex(digest, out);
+    return hasher.matches;
+}
+
+TEST(build_stamp_digest_equals_plain_sha256_without_a_stamp) {
+    uint8_t image[4096];
+    size_t len = stamp_test_image(image, sizeof(image), 0, false);
+    ASSERT_TRUE(len > 0);
+    char plain[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    cbm_sha256_hex(image, len, plain);
+    char stamped[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    ASSERT_EQ(stamp_test_hash_chunked(image, len, len, stamped), 0);
+    ASSERT_STR_EQ(stamped, plain);
+    PASS();
+}
+
+TEST(build_stamp_digest_ignores_payload_for_every_chunk_split) {
+    uint8_t zeroed[4096];
+    uint8_t filled[4096];
+    size_t len = stamp_test_image(zeroed, sizeof(zeroed), 0x00, true);
+    ASSERT_EQ(stamp_test_image(filled, sizeof(filled), 0xA5, true), len);
+    /* The fingerprint of an image is the plain SHA-256 with a zero payload. */
+    char expected[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    cbm_sha256_hex(zeroed, len, expected);
+    /* Every chunk size, so the magic and payload straddle every boundary. */
+    for (size_t chunk = 1; chunk <= CBM_BUILD_STAMP_MAGIC_LEN + CBM_BUILD_STAMP_PAYLOAD_LEN + 3;
+         chunk++) {
+        char got[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+        ASSERT_EQ(stamp_test_hash_chunked(filled, len, chunk, got), 1);
+        ASSERT_STR_EQ(got, expected);
+    }
+    char whole[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    ASSERT_EQ(stamp_test_hash_chunked(filled, len, len, whole), 1);
+    ASSERT_STR_EQ(whole, expected);
+    /* A change outside the payload still changes the fingerprint. */
+    filled[STAMP_TEST_PREFIX + CBM_BUILD_STAMP_MAGIC_LEN + CBM_BUILD_STAMP_PAYLOAD_LEN] ^= 1U;
+    char tampered[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    ASSERT_EQ(stamp_test_hash_chunked(filled, len, 7, tampered), 1);
+    ASSERT_STR_NEQ(tampered, expected);
+    PASS();
+}
+
+#ifndef _WIN32
+static bool stamp_test_write_bytes(const char *path, const uint8_t *data, size_t len) {
+    FILE *file = cbm_fopen(path, "wb");
+    if (!file) {
+        return false;
+    }
+    bool wrote = fwrite(data, 1, len, file) == len;
+    bool closed = fclose(file) == 0;
+    return wrote && closed;
+}
+
+TEST(build_stamp_command_writes_the_file_fingerprint_into_its_payload) {
+    char dir[VERSION_TEST_PATH_CAP] = {0};
+    char single[VERSION_TEST_PATH_CAP] = {0};
+    char twice[VERSION_TEST_PATH_CAP] = {0};
+    uint8_t image[4096];
+    size_t len = stamp_test_image(image, sizeof(image), 0x00, true);
+    uint8_t doubled[8192];
+    memcpy(doubled, image, len);
+    memcpy(doubled + len, image, len);
+    bool setup_ok = len > 0 && version_test_temp_dir(dir, "stamp") &&
+                    version_test_child_path(single, dir, "single.bin") &&
+                    version_test_child_path(twice, dir, "twice.bin") &&
+                    stamp_test_write_bytes(single, image, len) &&
+                    stamp_test_write_bytes(twice, doubled, len * 2U);
+    if (!setup_ok) {
+        version_test_cleanup(dir, single, twice, NULL);
+        FAIL("could not create stamp fixtures");
+    }
+    char before[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    ASSERT_TRUE(cbm_daemon_build_fingerprint_file(single, before));
+
+    char *argv_single[] = {single, NULL};
+    ASSERT_EQ(cbm_build_stamp_cmd(1, argv_single), 0);
+    /* Stamping does not change the fingerprint, and the payload now holds it. */
+    char after[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    ASSERT_TRUE(cbm_daemon_build_fingerprint_file(single, after));
+    ASSERT_STR_EQ(after, before);
+    FILE *file = cbm_fopen(single, "rb");
+    ASSERT_NOT_NULL(file);
+    uint8_t stamped[4096];
+    size_t got = fread(stamped, 1, sizeof(stamped), file);
+    (void)fclose(file);
+    ASSERT_EQ(got, len);
+    char payload_hex[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    stamp_test_digest_hex(stamped + STAMP_TEST_PREFIX + CBM_BUILD_STAMP_MAGIC_LEN, payload_hex);
+    ASSERT_STR_EQ(payload_hex, before);
+
+    /* An ambiguous image (two slots) is refused and left untouched. */
+    char twice_before[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char twice_after[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    ASSERT_TRUE(cbm_daemon_build_fingerprint_file(twice, twice_before));
+    char *argv_twice[] = {twice, NULL};
+    ASSERT_EQ(cbm_build_stamp_cmd(1, argv_twice), 1);
+    ASSERT_TRUE(cbm_daemon_build_fingerprint_file(twice, twice_after));
+    ASSERT_STR_EQ(twice_after, twice_before);
+
+    version_test_cleanup(dir, single, twice, NULL);
+    PASS();
+}
+#endif
 
 TEST(daemon_hello_accepts_only_the_exact_active_build_identity) {
     cbm_daemon_build_identity_t active = version_test_identity("2.4.0", BUILD_A);
@@ -693,6 +843,11 @@ TEST(daemon_conflict_log_windows_concurrent_appends_are_not_dropped) {
 SUITE(daemon_version) {
     RUN_TEST(daemon_rendezvous_key_is_stable_and_version_independent);
     RUN_TEST(daemon_build_fingerprint_hashes_exact_executable_bytes);
+    RUN_TEST(build_stamp_digest_equals_plain_sha256_without_a_stamp);
+    RUN_TEST(build_stamp_digest_ignores_payload_for_every_chunk_split);
+#ifndef _WIN32
+    RUN_TEST(build_stamp_command_writes_the_file_fingerprint_into_its_payload);
+#endif
     RUN_TEST(daemon_hello_accepts_only_the_exact_active_build_identity);
     RUN_TEST(daemon_hello_version_conflict_exposes_active_and_requested_builds);
     RUN_TEST(daemon_conflict_remedy_names_session_managed_daemon_and_its_sessions);

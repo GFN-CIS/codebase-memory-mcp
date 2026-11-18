@@ -4,6 +4,7 @@
 #include "index_supervisor.h"
 
 #include "daemon/runtime.h"
+#include "foundation/build_stamp.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h" /* cbm_mkdir_p, cbm_fopen */
 #include "foundation/constants.h"
@@ -241,6 +242,14 @@ bool cbm_index_supervisor_capture_build_fingerprint(void) {
     }
 #endif
     char captured[CBM_INDEX_WORKER_BUILD_FINGERPRINT_SIZE] = {0};
+    /* #2683: a stamped build carries its fingerprint in its own image, so a
+     * short-lived process (hook-augment) does not hash ~300 MB to learn it.
+     * This is only the claim the process presents; the daemon verifies peer
+     * images itself and checks its own image against the stamp at startup. */
+    if (cbm_build_stamp_self_fingerprint(captured)) {
+        (void)snprintf(g_build_fingerprint, sizeof(g_build_fingerprint), "%s", captured);
+        return true;
+    }
 #if defined(__linux__)
     char key_before[CBM_FP_CACHE_LINE];
     bool keyed = fp_cache_key(key_before, sizeof(key_before));

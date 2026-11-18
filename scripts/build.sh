@@ -156,4 +156,22 @@ else
         CFLAGS_EXTRA="$CFLAGS_EXTRA" "${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"}"
 fi
 
+# Step 3 (#2683): stamp the build identity into ELF executables so short-lived
+# processes read it instead of hashing the whole image. Stamp a copy: the
+# stamping process runs the binary being stamped. Release candidates are
+# re-stamped after strip by scripts/ci/prepare-release-candidates.sh.
+BIN="${BUILD_DIR}/codebase-memory-mcp"
+case "$(uname -s)" in
+Linux | FreeBSD | NetBSD)
+    cp "$BIN" "$BIN.stamp-tmp"
+    if "$BIN" build-stamp "$BIN.stamp-tmp" >/dev/null; then
+        mv -f "$BIN.stamp-tmp" "$BIN"
+    else
+        rm -f "$BIN.stamp-tmp"
+        echo "error: build-stamp failed" >&2
+        exit 1
+    fi
+    ;;
+esac
+
 echo "=== Build complete: ${BUILD_DIR}/codebase-memory-mcp ==="
