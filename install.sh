@@ -4,7 +4,7 @@ set -euo pipefail
 # install.sh — One-line installer for codebase-memory-mcp.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/GFN-CIS/codebase-memory-mcp/gfn/fingerprint-cache/install.sh | bash
 #   curl -fsSL ... | bash -s -- --dir /path   # Custom install directory
 #
 # Environment:
@@ -16,7 +16,7 @@ set -euo pipefail
 # called because the final line hasn't arrived yet.
 main() {
 
-REPO="DeusData/codebase-memory-mcp"
+REPO="GFN-CIS/codebase-memory-mcp"
 INSTALL_DIR="$HOME/.local/bin"
 SKIP_CONFIG=false
 CLIENTS_SET=false
@@ -168,7 +168,8 @@ fi
 # dynamically links glibc 2.38+ and fails on older distros (Debian 11, RHEL 8,
 # Ubuntu 20.04). macOS/Windows have no such variant.
 PORTABLE=""
-[ "$OS" = "linux" ] && PORTABLE="-portable"
+# GFN-CIS fork: releases ship a dynamic glibc build only (no -portable).
+# [ "$OS" = "linux" ] && PORTABLE="-portable"
 
 ARCHIVE="codebase-memory-mcp-${OS}-${ARCH}${PORTABLE}.${EXT}"
 
