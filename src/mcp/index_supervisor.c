@@ -116,6 +116,108 @@ void cbm_index_worker_log_begin(const char *args_json, const char *repo_path) {
 
 static bool worker_fingerprint_valid(const char *fingerprint);
 
+#if defined(__linux__)
+/* GFN-CIS fork (upstream #2683): every short-lived process (hook-augment in
+ * particular) used to hash the whole ~300 MB executable to learn its own build
+ * fingerprint. On CPUs without SHA instructions that costs ~2 s per hook call,
+ * past the 2000 ms hook deadline. Cache the digest on disk, keyed by the
+ * executable's identity metadata: device, inode, size, mtime and ctime with
+ * nanoseconds. On Linux an unprivileged user cannot set ctime, so replacing or
+ * rewriting the binary always changes the key and forces one re-hash. The
+ * daemon still verifies every peer image on its own, so a stale entry can only
+ * cause a refused admission (hooks fail open), never a false admission. */
+#define CBM_FP_CACHE_NAME ".build-fingerprint-cache"
+#define CBM_FP_CACHE_LINE 256
+
+static bool fp_cache_key(char *out, size_t out_size) {
+    struct stat st;
+    if (stat("/proc/self/exe", &st) != 0 || !S_ISREG(st.st_mode)) {
+        return false;
+    }
+    int n = snprintf(out, out_size, "v1 %llu %llu %lld %lld.%09ld %lld.%09ld",
+                     (unsigned long long)st.st_dev, (unsigned long long)st.st_ino,
+                     (long long)st.st_size, (long long)st.st_mtim.tv_sec,
+                     (long)st.st_mtim.tv_nsec, (long long)st.st_ctim.tv_sec,
+                     (long)st.st_ctim.tv_nsec);
+    return n > 0 && (size_t)n < out_size;
+}
+
+static bool fp_cache_path(char *out, size_t out_size) {
+    const char *dir = cbm_resolve_cache_dir();
+    if (!dir || !dir[0]) {
+        return false;
+    }
+    int n = snprintf(out, out_size, "%s/%s", dir, CBM_FP_CACHE_NAME);
+    return n > 0 && (size_t)n < out_size;
+}
+
+static bool fp_cache_load(const char *key, char fingerprint[CBM_INDEX_WORKER_BUILD_FINGERPRINT_SIZE]) {
+    char path[CBM_SZ_4K];
+    if (!fp_cache_path(path, sizeof(path))) {
+        return false;
+    }
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    struct stat st;
+    /* Trust only a regular file we own that nobody else can write. */
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
+        (st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+        close(fd);
+        return false;
+    }
+    char buf[CBM_FP_CACHE_LINE];
+    ssize_t got = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (got <= 0) {
+        return false;
+    }
+    buf[got] = '\0';
+    char *nl = strchr(buf, '\n');
+    if (!nl) {
+        return false;
+    }
+    *nl = '\0';
+    if (strcmp(buf, key) != 0) {
+        return false;
+    }
+    char *value = nl + 1;
+    char *end = strchr(value, '\n');
+    if (end) {
+        *end = '\0';
+    }
+    if (!worker_fingerprint_valid(value)) {
+        return false;
+    }
+    (void)snprintf(fingerprint, CBM_INDEX_WORKER_BUILD_FINGERPRINT_SIZE, "%s", value);
+    return true;
+}
+
+static void fp_cache_store(const char *key, const char *fingerprint) {
+    char path[CBM_SZ_4K];
+    char tmp[CBM_SZ_4K + 32];
+    if (!fp_cache_path(path, sizeof(path))) {
+        return;
+    }
+    int n = snprintf(tmp, sizeof(tmp), "%s.%ld.tmp", path, (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(tmp)) {
+        return;
+    }
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        return;
+    }
+    char line[CBM_FP_CACHE_LINE + CBM_INDEX_WORKER_BUILD_FINGERPRINT_SIZE + 4];
+    int len = snprintf(line, sizeof(line), "%s\n%s\n", key, fingerprint);
+    bool ok = len > 0 && (size_t)len < sizeof(line) && write(fd, line, (size_t)len) == len;
+    ok = (close(fd) == 0) && ok;
+    if (!ok || rename(tmp, path) != 0) {
+        (void)unlink(tmp);
+    }
+}
+#endif /* __linux__ */
+
 bool cbm_index_supervisor_capture_build_fingerprint(void) {
     if (g_build_fingerprint_capture_attempted) {
         return g_build_fingerprint[0] != '\0';
@@ -139,9 +241,25 @@ bool cbm_index_supervisor_capture_build_fingerprint(void) {
     }
 #endif
     char captured[CBM_INDEX_WORKER_BUILD_FINGERPRINT_SIZE] = {0};
+#if defined(__linux__)
+    char key_before[CBM_FP_CACHE_LINE];
+    bool keyed = fp_cache_key(key_before, sizeof(key_before));
+    if (keyed && fp_cache_load(key_before, captured)) {
+        (void)snprintf(g_build_fingerprint, sizeof(g_build_fingerprint), "%s", captured);
+        return true;
+    }
+#endif
     if (!cbm_daemon_runtime_process_build_fingerprint((uint64_t)worker_getpid(), captured)) {
         return false;
     }
+#if defined(__linux__)
+    /* Store only if the image did not change while it was being hashed. */
+    char key_after[CBM_FP_CACHE_LINE];
+    if (keyed && fp_cache_key(key_after, sizeof(key_after)) &&
+        strcmp(key_before, key_after) == 0) {
+        fp_cache_store(key_after, captured);
+    }
+#endif
     (void)snprintf(g_build_fingerprint, sizeof(g_build_fingerprint), "%s", captured);
     return true;
 }
